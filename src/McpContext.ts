@@ -5,10 +5,23 @@
  */
 
 import fs from 'node:fs/promises';
+import fsPromises from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
+import {fileURLToPath, pathToFileURL} from 'node:url';
 
-import type {TargetUniverse} from './DevtoolsUtils.js';
-import {UniverseManager} from './DevtoolsUtils.js';
+import type {TargetUniverse} from './devtools/DevtoolsUtils.js';
+import {
+  overrideDevToolsGlobals,
+  UniverseManager,
+} from './devtools/DevtoolsUtils.js';
+import {HeapSnapshotManager} from './HeapSnapshotManager.js';
+import type {
+  AggregatedInfoWithId,
+  HeapSnapshotClassDiff,
+  HeapSnapshotDetailedClassDiff,
+  DuplicateStringGroup,
+} from './HeapSnapshotManager.js';
 import {McpPage} from './McpPage.js';
 import {
   NetworkCollector,
@@ -16,37 +29,33 @@ import {
   type ListenerMap,
   type UncaughtError,
 } from './PageCollector.js';
-import type {DevTools} from './third_party/index.js';
-import type {
-  Browser,
-  BrowserContext,
-  ConsoleMessage,
-  Debugger,
-  HTTPRequest,
-  Page,
-  ScreenRecorder,
-  SerializedAXNode,
-  Viewport,
-  Target,
+import {ServiceWorkerConsoleCollector} from './ServiceWorkerCollector.js';
+import {
+  Locator,
+  PredefinedNetworkConditions,
+  type Browser,
+  type BrowserContext,
+  type ConsoleMessage,
+  type HTTPRequest,
+  type Page,
+  type ScreenRecorder,
+  type Viewport,
+  type Target,
+  type Extension,
+  type Root,
+  type DevTools,
 } from './third_party/index.js';
-import {Locator} from './third_party/index.js';
-import {PredefinedNetworkConditions} from './third_party/index.js';
 import {listPages} from './tools/pages.js';
 import {CLOSE_PAGE_ERROR} from './tools/ToolDefinition.js';
-import type {Context, DevToolsData} from './tools/ToolDefinition.js';
+import type {Context, SupportedExtensions} from './tools/ToolDefinition.js';
 import type {TraceResult} from './trace-processing/parse.js';
+import type {Logger} from './types.js';
 import type {
   EmulationSettings,
   GeolocationOptions,
-  TextSnapshot,
-  TextSnapshotNode,
   ExtensionServiceWorker,
 } from './types.js';
-import {
-  ExtensionRegistry,
-  type InstalledExtension,
-} from './utils/ExtensionRegistry.js';
-import {saveTemporaryFile} from './utils/files.js';
+import {getTempFilePath, resolveCanonicalPath} from './utils/files.js';
 import {getNetworkMultiplierFromString} from './WaitForHelper.js';
 
 interface McpContextOptions {
@@ -56,6 +65,10 @@ interface McpContextOptions {
   experimentalIncludeAllPages?: boolean;
   // Whether CrUX data should be fetched.
   performanceCrux: boolean;
+  // The allow list of URL patterns to allow loading resources.
+  allowList?: string[];
+  // The block list of URL patterns to block loading resources.
+  blocklist?: string[];
 }
 
 const DEFAULT_TIMEOUT = 5_000;
@@ -63,7 +76,7 @@ const NAVIGATION_TIMEOUT = 10_000;
 
 export class McpContext implements Context {
   browser: Browser;
-  logger: Debugger;
+  logger: Logger;
 
   // Maps LLM-provided isolatedContext name → Puppeteer BrowserContext.
   #isolatedContexts = new Map<string, BrowserContext>();
@@ -78,7 +91,7 @@ export class McpContext implements Context {
   #networkCollector: NetworkCollector;
   #consoleCollector: ConsoleCollector;
   #devtoolsUniverseManager: UniverseManager;
-  #extensionRegistry = new ExtensionRegistry();
+  #serviceWorkerConsoleCollector: ServiceWorkerConsoleCollector;
 
   #isRunningTrace = false;
   #screenRecorderData: {recorder: ScreenRecorder; filePath: string} | null =
@@ -90,18 +103,25 @@ export class McpContext implements Context {
   #extensionServiceWorkerMap = new WeakMap<Target, string>();
   #nextExtensionServiceWorkerId = 1;
 
-  #nextSnapshotId = 1;
   #traceResults: TraceResult[] = [];
 
   #locatorClass: typeof Locator;
   #options: McpContextOptions;
+  #heapSnapshotManager = new HeapSnapshotManager();
+  #roots: Root[] | undefined = undefined;
 
   private constructor(
     browser: Browser,
-    logger: Debugger,
+    logger: Logger,
     options: McpContextOptions,
     locatorClass: typeof Locator,
   ) {
+    overrideDevToolsGlobals({
+      loadResource: (url: string) => {
+        return this.loadResource(url);
+      },
+    });
+
     this.browser = browser;
     this.logger = logger;
     this.#locatorClass = locatorClass;
@@ -117,26 +137,31 @@ export class McpContext implements Context {
         uncaughtError: event => {
           collect(event);
         },
-        issue: event => {
+        devtoolsAggregatedIssue: event => {
           collect(event);
         },
       } as ListenerMap;
     });
+    this.#serviceWorkerConsoleCollector = new ServiceWorkerConsoleCollector(
+      this.browser,
+    );
     this.#devtoolsUniverseManager = new UniverseManager(this.browser);
   }
 
   async #init() {
     const pages = await this.createPagesSnapshot();
-    await this.createExtensionServiceWorkersSnapshot();
+    const workers = await this.createExtensionServiceWorkersSnapshot();
     await this.#networkCollector.init(pages);
     await this.#consoleCollector.init(pages);
     await this.#devtoolsUniverseManager.init(pages);
+    await this.#serviceWorkerConsoleCollector.init(workers);
   }
 
   dispose() {
     this.#networkCollector.dispose();
     this.#consoleCollector.dispose();
     this.#devtoolsUniverseManager.dispose();
+    this.#serviceWorkerConsoleCollector.dispose();
     for (const mcpPage of this.#mcpPages.values()) {
       mcpPage.dispose();
     }
@@ -149,7 +174,7 @@ export class McpContext implements Context {
 
   static async from(
     browser: Browser,
-    logger: Debugger,
+    logger: Logger,
     opts: McpContextOptions,
     /* Let tests use unbundled Locator class to avoid overly strict checks within puppeteer that fail when mixing bundled and unbundled class instances */
     locatorClass: typeof Locator = Locator,
@@ -159,9 +184,103 @@ export class McpContext implements Context {
     return context;
   }
 
+  roots(): Root[] | undefined {
+    if (this.#roots === undefined) {
+      return undefined;
+    }
+    return [
+      ...this.#roots,
+      {
+        uri: pathToFileURL(os.tmpdir()).href,
+        name: 'temp',
+      },
+    ];
+  }
+
+  setRoots(roots: Root[] | undefined): void {
+    this.#roots = roots;
+  }
+
+  async validatePath(filePath?: string): Promise<void> {
+    if (filePath === undefined) {
+      return;
+    }
+    const roots = this.roots();
+    if (roots === undefined) {
+      return;
+    }
+
+    let canonicalPath: string;
+
+    try {
+      canonicalPath = await resolveCanonicalPath(filePath);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[MCP Context] Error resolving real path for ${filePath}: ${errMsg}`,
+      );
+      throw new Error(
+        `Access denied: Cannot resolve base path for ${filePath}.`,
+      );
+    }
+
+    let allowed = false;
+    const resolvedRoots = await Promise.allSettled(
+      roots.map(async root => {
+        const rootPathUri = root.uri;
+        const rootPath = path.resolve(fileURLToPath(rootPathUri));
+        return await fsPromises.realpath(rootPath);
+      }),
+    );
+
+    for (let i = 0; i < roots.length; i++) {
+      const root = roots[i];
+      const result = resolvedRoots[i];
+
+      if (result.status === 'fulfilled') {
+        const canonicalRoot = result.value;
+        if (
+          canonicalPath === canonicalRoot ||
+          canonicalPath.startsWith(canonicalRoot + path.sep)
+        ) {
+          allowed = true;
+          break;
+        }
+      } else {
+        const rootErr = result.reason;
+        const errMsg =
+          rootErr instanceof Error ? rootErr.message : String(rootErr);
+        console.warn(
+          `[MCP Context] Could not resolve configured root ${root.uri}: ${errMsg}`,
+        );
+        // Skip this root if it cannot be resolved.
+      }
+    }
+
+    if (!allowed) {
+      throw new Error(
+        `Access denied: path ${filePath} (canonical: ${canonicalPath}) is not within any of the configured workspace roots.`,
+      );
+    }
+  }
+
+  async ensureExtension<Extension extends `.${string}`>(
+    filePath: string,
+    extension: Extension,
+  ): Promise<`${string}${Extension}`> {
+    const resolvedPath = path.resolve(filePath);
+    const currentExtension = path.extname(resolvedPath);
+    const outputPath: `${string}${Extension}` = `${resolvedPath.slice(
+      0,
+      resolvedPath.length - currentExtension.length,
+    )}${extension}`;
+    await this.validatePath(outputPath);
+    return outputPath;
+  }
+
   resolveCdpRequestId(page: McpPage, cdpRequestId: string): number | undefined {
     if (!cdpRequestId) {
-      this.logger('no network request');
+      this.logger?.('no network request');
       return;
     }
     const request = this.#networkCollector.find(page.pptrPage, request => {
@@ -169,37 +288,10 @@ export class McpContext implements Context {
       return request.id === cdpRequestId;
     });
     if (!request) {
-      this.logger('no network request for ' + cdpRequestId);
+      this.logger?.('no network request for ' + cdpRequestId);
       return;
     }
     return this.#networkCollector.getIdForResource(request);
-  }
-
-  resolveCdpElementId(
-    page: McpPage,
-    cdpBackendNodeId: number,
-  ): string | undefined {
-    if (!cdpBackendNodeId) {
-      this.logger('no cdpBackendNodeId');
-      return;
-    }
-    const snapshot = page.textSnapshot;
-    if (!snapshot) {
-      this.logger('no text snapshot');
-      return;
-    }
-    // TODO: index by backendNodeId instead.
-    const queue = [snapshot.root];
-    while (queue.length) {
-      const current = queue.pop()!;
-      if (current.backendNodeId === cdpBackendNodeId) {
-        return current.id;
-      }
-      for (const child of current.children) {
-        queue.push(child);
-      }
-    }
-    return;
   }
 
   getNetworkRequests(
@@ -281,6 +373,10 @@ export class McpContext implements Context {
     await this.emulate(currentSetting, page.pptrPage);
   }
 
+  get #hasNetworkBlockOrAllowlist(): boolean {
+    return !!(this.#options.allowList || this.#options.blocklist);
+  }
+
   async emulate(
     options: {
       networkConditions?: string;
@@ -289,6 +385,7 @@ export class McpContext implements Context {
       userAgent?: string;
       colorScheme?: 'dark' | 'light' | 'auto';
       viewport?: Viewport;
+      extraHttpHeaders?: Record<string, string> | undefined;
     },
     targetPage?: Page,
   ): Promise<void> {
@@ -296,7 +393,14 @@ export class McpContext implements Context {
     const mcpPage = this.#getMcpPage(page);
     const newSettings: EmulationSettings = {...mcpPage.emulationSettings};
 
-    if (!options.networkConditions) {
+    // Skip network emulation if blocklist/allowlist is configured, as it conflicts with blocking rules in Puppeteer.
+    if (this.#hasNetworkBlockOrAllowlist) {
+      if (options.networkConditions !== undefined) {
+        throw new Error(
+          'Network throttling is not supported when network blocking (allowlist/blocklist) is configured.',
+        );
+      }
+    } else if (!options.networkConditions) {
       await page.emulateNetworkConditions(null);
       delete newSettings.networkConditions;
     } else if (options.networkConditions === 'Offline') {
@@ -316,11 +420,22 @@ export class McpContext implements Context {
       newSettings.networkConditions = options.networkConditions;
     }
 
+    const secondarySession = this.getDevToolsUniverse(mcpPage)?.session;
     if (!options.cpuThrottlingRate) {
       await page.emulateCPUThrottling(1);
+      if (secondarySession) {
+        await secondarySession.send('Emulation.setCPUThrottlingRate', {
+          rate: 1,
+        });
+      }
       delete newSettings.cpuThrottlingRate;
     } else {
       await page.emulateCPUThrottling(options.cpuThrottlingRate);
+      if (secondarySession) {
+        await secondarySession.send('Emulation.setCPUThrottlingRate', {
+          rate: options.cpuThrottlingRate,
+        });
+      }
       newSettings.cpuThrottlingRate = options.cpuThrottlingRate;
     }
 
@@ -353,7 +468,6 @@ export class McpContext implements Context {
     }
 
     if (!options.viewport) {
-      await page.setViewport(null);
       delete newSettings.viewport;
     } else {
       const defaults = {
@@ -362,9 +476,15 @@ export class McpContext implements Context {
         hasTouch: false,
         isLandscape: false,
       };
-      const viewport = {...defaults, ...options.viewport};
-      await page.setViewport(viewport);
-      newSettings.viewport = viewport;
+      newSettings.viewport = {...defaults, ...options.viewport};
+    }
+
+    if (options.extraHttpHeaders !== undefined) {
+      await page.setExtraHTTPHeaders(options.extraHttpHeaders);
+      newSettings.extraHttpHeaders = options.extraHttpHeaders;
+      if (Object.keys(options.extraHttpHeaders).length === 0) {
+        delete newSettings.extraHttpHeaders;
+      }
     }
 
     mcpPage.emulationSettings = Object.keys(newSettings).length
@@ -372,6 +492,10 @@ export class McpContext implements Context {
       : {};
 
     this.#updateSelectedPageTimeouts();
+
+    // This should happen after updating the page timeouts.
+    // Setting the viewport can trigger a reload which we don't want to timeout.
+    await page.setViewport(newSettings.viewport ?? null);
   }
 
   setIsRunningPerformanceTrace(x: boolean): void {
@@ -455,12 +579,12 @@ export class McpContext implements Context {
     page.pptrPage.setDefaultTimeout(DEFAULT_TIMEOUT * cpuMultiplier);
     // 10sec should be enough for the load event to be emitted during
     // navigations.
-    // Increased in case we throttle the network requests
+    // Increased in case we throttle the network requests or the CPU
     const networkMultiplier = getNetworkMultiplierFromString(
       page.networkConditions,
     );
     page.pptrPage.setDefaultNavigationTimeout(
-      NAVIGATION_TIMEOUT * networkMultiplier,
+      NAVIGATION_TIMEOUT * networkMultiplier * cpuMultiplier,
     );
   }
 
@@ -512,6 +636,12 @@ export class McpContext implements Context {
     return this.#extensionServiceWorkers;
   }
 
+  getServiceWorkerConsoleData(
+    extensionId: string,
+  ): Array<ConsoleMessage | UncaughtError> {
+    return this.#serviceWorkerConsoleCollector.getData(extensionId);
+  }
+
   async createPagesSnapshot(): Promise<Page[]> {
     const {pages: allPages, isolatedContextNames} = await this.#getAllPages();
 
@@ -522,7 +652,7 @@ export class McpContext implements Context {
         this.#mcpPages.set(page, mcpPage);
         // We emulate a focused page for all pages to support multi-agent workflows.
         void page.emulateFocusedPage(true).catch(error => {
-          this.logger('Error turning on focused page emulation', error);
+          this.logger?.('Error turning on focused page emulation', error);
         });
       }
       mcpPage.isolatedContextName = isolatedContextNames.get(page);
@@ -586,7 +716,7 @@ export class McpContext implements Context {
             page = await target.asPage();
             this.#extensionPages.set(target, page);
           } catch (e) {
-            this.logger('Failed to get page for extension target', e);
+            this.logger?.('Failed to get page for extension target', e);
           }
         }
       }
@@ -627,7 +757,7 @@ export class McpContext implements Context {
   }
 
   async detectOpenDevToolsWindows() {
-    this.logger('Detecting open DevTools windows');
+    this.logger?.('Detecting open DevTools windows');
     const {pages} = await this.#getAllPages();
 
     await Promise.all(
@@ -671,145 +801,35 @@ export class McpContext implements Context {
     return this.#mcpPages.get(page)?.isolatedContextName;
   }
 
-  getDevToolsPage(page: Page): Page | undefined {
-    return this.#mcpPages.get(page)?.devToolsPage;
-  }
-
-  async getDevToolsData(page: McpPage): Promise<DevToolsData> {
-    try {
-      this.logger('Getting DevTools UI data');
-      const devtoolsPage = this.getDevToolsPage(page.pptrPage);
-      if (!devtoolsPage) {
-        this.logger('No DevTools page detected');
-        return {};
-      }
-      const {cdpRequestId, cdpBackendNodeId} = await devtoolsPage.evaluate(
-        async () => {
-          // @ts-expect-error no types
-          const UI = await import('/bundled/ui/legacy/legacy.js');
-          // @ts-expect-error no types
-          const SDK = await import('/bundled/core/sdk/sdk.js');
-          const request = UI.Context.Context.instance().flavor(
-            SDK.NetworkRequest.NetworkRequest,
-          );
-          const node = UI.Context.Context.instance().flavor(
-            SDK.DOMModel.DOMNode,
-          );
-          return {
-            cdpRequestId: request?.requestId(),
-            cdpBackendNodeId: node?.backendNodeId(),
-          };
-        },
-      );
-      return {cdpBackendNodeId, cdpRequestId};
-    } catch (err) {
-      this.logger('error getting devtools data', err);
-    }
-    return {};
-  }
-
-  /**
-   * Creates a text snapshot of a page.
-   */
-  async createTextSnapshot(
-    page: McpPage,
-    verbose = false,
-    devtoolsData: DevToolsData | undefined = undefined,
-  ): Promise<void> {
-    const rootNode = await page.pptrPage.accessibility.snapshot({
-      includeIframes: true,
-      interestingOnly: !verbose,
-    });
-    if (!rootNode) {
-      return;
-    }
-
-    const {uniqueBackendNodeIdToMcpId} = page;
-
-    const snapshotId = this.#nextSnapshotId++;
-    // Iterate through the whole accessibility node tree and assign node ids that
-    // will be used for the tree serialization and mapping ids back to nodes.
-    let idCounter = 0;
-    const idToNode = new Map<string, TextSnapshotNode>();
-    const seenUniqueIds = new Set<string>();
-    const assignIds = (node: SerializedAXNode): TextSnapshotNode => {
-      let id = '';
-      // @ts-expect-error untyped loaderId & backendNodeId.
-      const uniqueBackendId = `${node.loaderId}_${node.backendNodeId}`;
-      if (uniqueBackendNodeIdToMcpId.has(uniqueBackendId)) {
-        // Re-use MCP exposed ID if the uniqueId is the same.
-        id = uniqueBackendNodeIdToMcpId.get(uniqueBackendId)!;
-      } else {
-        // Only generate a new ID if we have not seen the node before.
-        id = `${snapshotId}_${idCounter++}`;
-        uniqueBackendNodeIdToMcpId.set(uniqueBackendId, id);
-      }
-      seenUniqueIds.add(uniqueBackendId);
-
-      const nodeWithId: TextSnapshotNode = {
-        ...node,
-        id,
-        children: node.children
-          ? node.children.map(child => assignIds(child))
-          : [],
-      };
-
-      // The AXNode for an option doesn't contain its `value`.
-      // Therefore, set text content of the option as value.
-      if (node.role === 'option') {
-        const optionText = node.name;
-        if (optionText) {
-          nodeWithId.value = optionText.toString();
-        }
-      }
-
-      idToNode.set(nodeWithId.id, nodeWithId);
-      return nodeWithId;
-    };
-
-    const rootNodeWithId = assignIds(rootNode);
-    const snapshot: TextSnapshot = {
-      root: rootNodeWithId,
-      snapshotId: String(snapshotId),
-      idToNode,
-      hasSelectedElement: false,
-      verbose,
-    };
-    page.textSnapshot = snapshot;
-    const data = devtoolsData ?? (await this.getDevToolsData(page));
-    if (data?.cdpBackendNodeId) {
-      snapshot.hasSelectedElement = true;
-      snapshot.selectedElementUid = this.resolveCdpElementId(
-        page,
-        data?.cdpBackendNodeId,
-      );
-    }
-
-    // Clean up unique IDs that we did not see anymore.
-    for (const key of uniqueBackendNodeIdToMcpId.keys()) {
-      if (!seenUniqueIds.has(key)) {
-        uniqueBackendNodeIdToMcpId.delete(key);
-      }
-    }
-  }
-
   async saveTemporaryFile(
     data: Uint8Array<ArrayBufferLike>,
     filename: string,
   ): Promise<{filepath: string}> {
-    return await saveTemporaryFile(data, filename);
+    const filepath = await getTempFilePath(filename);
+    await this.validatePath(filepath);
+    try {
+      await fs.writeFile(filepath, data);
+    } catch (err) {
+      throw new Error('Could not save a file', {cause: err});
+    }
+    return {filepath};
   }
+
   async saveFile(
     data: Uint8Array<ArrayBufferLike>,
-    filename: string,
+    clientProvidedFilePath: string,
+    extension: SupportedExtensions,
   ): Promise<{filename: string}> {
+    const filePath = await this.ensureExtension(
+      clientProvidedFilePath,
+      extension,
+    );
     try {
-      const filePath = path.resolve(filename);
       await fs.mkdir(path.dirname(filePath), {recursive: true});
       await fs.writeFile(filePath, data);
       return {filename: filePath};
     } catch (err) {
-      this.logger(err);
+      this.logger?.(err);
       throw new Error('Could not save a file', {cause: err});
     }
   }
@@ -872,37 +892,179 @@ export class McpContext implements Context {
 
   async installExtension(extensionPath: string): Promise<string> {
     const id = await this.browser.installExtension(extensionPath);
-    await this.#extensionRegistry.registerExtension(id, extensionPath);
     return id;
   }
 
   async uninstallExtension(id: string): Promise<void> {
     await this.browser.uninstallExtension(id);
-    this.#extensionRegistry.remove(id);
   }
 
   async triggerExtensionAction(id: string): Promise<void> {
+    const extensions = await this.browser.extensions();
+    const extension = extensions.get(id);
+    if (!extension) {
+      throw new Error(`Extension with ID ${id} not found.`);
+    }
     const page = this.getSelectedPptrPage();
-    // @ts-expect-error internal puppeteer api is needed since we don't have a way to get
-    // a tab id at the moment
-    const theTarget = page._tabId;
-    const session = await this.browser.target().createCDPSession();
+    await extension.triggerAction(page);
+  }
 
-    try {
-      await session.send('Extensions.triggerAction', {
-        id,
-        targetId: theTarget,
-      });
-    } finally {
-      await session.detach();
+  listExtensions(): Promise<Map<string, Extension>> {
+    return this.browser.extensions();
+  }
+
+  async getExtension(id: string): Promise<Extension | undefined> {
+    const pptrExtensions = await this.browser.extensions();
+    return pptrExtensions.get(id);
+  }
+
+  async getHeapSnapshotAggregates(
+    filePath: string,
+  ): Promise<Record<string, AggregatedInfoWithId>> {
+    return await this.#heapSnapshotManager.getAggregates(filePath);
+  }
+
+  async getHeapSnapshotDuplicateStrings(
+    filePath: string,
+  ): Promise<DuplicateStringGroup[]> {
+    return await this.#heapSnapshotManager.getDuplicateStrings(filePath);
+  }
+
+  async getHeapSnapshotStats(
+    filePath: string,
+  ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotModel.Statistics> {
+    return await this.#heapSnapshotManager.getStats(filePath);
+  }
+
+  async getHeapSnapshotStaticData(
+    filePath: string,
+  ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotModel.StaticData | null> {
+    return await this.#heapSnapshotManager.getStaticData(filePath);
+  }
+
+  async getHeapSnapshotNodesById(
+    filePath: string,
+    id: number,
+  ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotModel.ItemsRange> {
+    return await this.#heapSnapshotManager.getNodesById(filePath, id);
+  }
+
+  async getHeapSnapshotRetainers(
+    filePath: string,
+    nodeId: number,
+  ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotModel.ItemsRange> {
+    return await this.#heapSnapshotManager.getRetainers(filePath, nodeId);
+  }
+
+  async closeHeapSnapshot(filePath: string): Promise<boolean> {
+    return this.#heapSnapshotManager.dispose(filePath);
+  }
+
+  hasHeapSnapshots(): boolean {
+    return this.#heapSnapshotManager.hasSnapshots();
+  }
+
+  async getHeapSnapshotRetainingPaths(
+    filePath: string,
+    nodeId: number,
+    maxDepth?: number,
+    maxNodes?: number,
+    maxSiblings?: number,
+  ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotModel.RetainingPaths> {
+    return await this.#heapSnapshotManager.getRetainingPaths(
+      filePath,
+      nodeId,
+      maxDepth,
+      maxNodes,
+      maxSiblings,
+    );
+  }
+
+  async getHeapSnapshotDominators(
+    filePath: string,
+    nodeId: number,
+  ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotModel.DominatorChain> {
+    return await this.#heapSnapshotManager.getDominatorsOf(filePath, nodeId);
+  }
+
+  #validateUrlNotBlocked(url: URL): void {
+    if (!this.#options.blocklist) {
+      return;
+    }
+    for (const block of this.#options.blocklist) {
+      const pattern = new URLPattern(block);
+      if (pattern.test(url)) {
+        throw new Error(`Blocked by blocklist: ${url}`);
+      }
     }
   }
 
-  listExtensions(): InstalledExtension[] {
-    return this.#extensionRegistry.list();
+  #validateUrlAllowed(url: URL): void {
+    if (!this.#options.allowList) {
+      return;
+    }
+    for (const allow of this.#options.allowList) {
+      const pattern = new URLPattern(allow);
+      if (pattern.test(url)) {
+        return;
+      }
+    }
+    throw new Error(`Not allowed by allowlist: ${url}`);
   }
 
-  getExtension(id: string): InstalledExtension | undefined {
-    return this.#extensionRegistry.getById(id);
+  async loadResource(path: string): Promise<string> {
+    const url = new URL(path);
+
+    this.#validateUrlNotBlocked(url);
+
+    switch (url.protocol) {
+      case 'https:':
+      case 'http:': {
+        this.#validateUrlAllowed(url);
+
+        const response = await fetch(url);
+        if (!response.ok) {
+          throw new Error(`Failed to load resource: ${url}`);
+        }
+        return response.text();
+      }
+
+      case 'file:': {
+        await this.validatePath(fileURLToPath(url));
+        return await fsPromises.readFile(url, 'utf-8');
+      }
+
+      default:
+        throw new Error(`Unsupported protocol for: ${url}`);
+    }
+  }
+
+  async getHeapSnapshotEdges(
+    filePath: string,
+    nodeId: number,
+  ): Promise<DevTools.HeapSnapshotModel.HeapSnapshotModel.ItemsRange> {
+    return await this.#heapSnapshotManager.getEdges(filePath, nodeId);
+  }
+
+  async getHeapSnapshotClassDiffs(
+    baseFilePath: string,
+    currentFilePath: string,
+  ): Promise<HeapSnapshotClassDiff[]> {
+    return await this.#heapSnapshotManager.getClassDiffs(
+      baseFilePath,
+      currentFilePath,
+    );
+  }
+
+  async getHeapSnapshotDetailedClassDiff(
+    baseFilePath: string,
+    currentFilePath: string,
+    classIndex: number,
+  ): Promise<HeapSnapshotDetailedClassDiff> {
+    return await this.#heapSnapshotManager.getDetailedClassDiff(
+      baseFilePath,
+      currentFilePath,
+      classIndex,
+    );
   }
 }

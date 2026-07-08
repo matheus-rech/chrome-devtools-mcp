@@ -10,7 +10,8 @@ import {describe, it} from 'node:test';
 import type {ElementHandle} from 'puppeteer-core';
 
 import {SnapshotFormatter} from '../../src/formatters/SnapshotFormatter.js';
-import type {TextSnapshot, TextSnapshotNode} from '../../src/types.js';
+import type {TextSnapshot} from '../../src/TextSnapshot.js';
+import type {TextSnapshotNode} from '../../src/types.js';
 
 describe('snapshotFormatter', () => {
   it('formats a snapshot with value properties', () => {
@@ -187,10 +188,13 @@ describe('snapshotFormatter', () => {
       idToNode: new Map(),
       hasSelectedElement: true,
       verbose: false,
+      resolveCdpElementId() {
+        return undefined;
+      },
     });
     const formatted = formatter.toString();
 
-    t.assert.snapshot?.(formatted);
+    t.assert.snapshot(formatted);
   });
 
   it('does not include a note if the snapshot is already verbose', t => {
@@ -221,10 +225,13 @@ describe('snapshotFormatter', () => {
       idToNode: new Map(),
       hasSelectedElement: true,
       verbose: true,
+      resolveCdpElementId() {
+        return undefined;
+      },
     });
     const formatted = formatter.toString();
 
-    t.assert.snapshot?.(formatted);
+    t.assert.snapshot(formatted);
   });
 
   it('formats with DevTools data included into a snapshot', t => {
@@ -256,10 +263,13 @@ describe('snapshotFormatter', () => {
       hasSelectedElement: true,
       selectedElementUid: '1_1',
       verbose: false,
+      resolveCdpElementId() {
+        return '1_1';
+      },
     });
     const formatted = formatter.toString();
 
-    t.assert.snapshot?.(formatted);
+    t.assert.snapshot(formatted);
   });
 
   it('toJSON returns expected structure', () => {
